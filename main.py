@@ -2,14 +2,23 @@
 import os
 import subprocess
 import tempfile
-from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="ClipMaker AI",
     description="Motor de procesamiento de videos"
+)
+
+# Permitir conexiones desde la aplicación web
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/")
