@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from google import genai
+from supabase import create_client
 
 
 app = FastAPI(
@@ -33,6 +34,36 @@ app.add_middleware(
 
 JOBS_DIR = Path("/tmp/clipmaker_jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+SUPABASE_BUCKET = "clipmaker-clips"
+
+
+def get_supabase_client():
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+    if not supabase_url or not supabase_key:
+        raise RuntimeError(
+            "Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en Render"
+        )
+
+    return create_client(supabase_url, supabase_key)
+
+
+def upload_clip_to_supabase(supabase, local_path, job_id, filename):
+    storage_path = f"{job_id}/{filename}"
+
+    with open(local_path, "rb") as clip_file:
+        supabase.storage.from_(SUPABASE_BUCKET).upload(
+            path=storage_path,
+            file=clip_file,
+            file_options={
+                "content-type": "video/mp4",
+                "cache-control": "3600"
+            }
+        )
+
+    return supabase.storage.from_(SUPABASE_BUCKET).get_public_url(storage_path)
 
 app.mount(
     "/clips",
@@ -600,8 +631,9 @@ def process_ai(
         )
 
         generated_clips = []
+        supabase = get_supabase_client()
 
-        # Crear cada MP4 con FFmpeg
+        # Crear cada MP4 con FFmpeg y guardarlo de forma permanente en Supabase
         for index, moment in enumerate(selected_clips):
             filename = f"clip_{index + 1:02d}.mp4"
             output_path = job_dir / filename
@@ -615,6 +647,13 @@ def process_ai(
                 duration
             )
 
+            public_url = upload_clip_to_supabase(
+                supabase,
+                output_path,
+                job_id,
+                filename
+            )
+
             generated_clips.append({
                 "number": index + 1,
                 "filename": filename,
@@ -623,7 +662,7 @@ def process_ai(
                 "title": moment["title"],
                 "reason": moment["reason"],
                 "score": moment["score"],
-                "url": f"/clips/{job_id}/{filename}"
+                "url": public_url
             })
 
         return {
