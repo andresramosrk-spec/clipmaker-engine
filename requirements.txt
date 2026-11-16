@@ -4,3 +4,4 @@ uvicorn
 python-multipart
 ffmpeg-python
 google-genai>=2.28.0
+supabase
