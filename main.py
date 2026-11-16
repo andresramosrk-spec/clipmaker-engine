@@ -1,9 +1,4 @@
-
 import os
-import re
-import json
-import time
-import random
 import uuid
 import shutil
 import subprocess
@@ -16,13 +11,10 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from google import genai
-from supabase import create_client
-
 
 app = FastAPI(
-    title="ClipMaker AI",
-    description="Motor inteligente de procesamiento de videos"
+    title="ClipMaker Engine",
+    description="Motor rápido de generación de clips verticales sin IA"
 )
 
 app.add_middleware(
@@ -36,77 +28,10 @@ app.add_middleware(
 JOBS_DIR = Path("/tmp/clipmaker_jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-SUPABASE_BUCKET = "clipmaker-clips"
+ALLOWED_QUANTITIES = [5, 10, 15, 30, 50]
+ALLOWED_DURATIONS = [15, 30, 45, 60]
+MAX_UPLOAD_BYTES = 300 * 1024 * 1024
 
-
-class GeminiTemporarilyUnavailable(Exception):
-    """Gemini está temporalmente saturado o limitando solicitudes."""
-
-
-def is_retryable_gemini_error(error):
-    message = str(error).upper()
-    retryable_markers = (
-        "429", "500", "502", "503", "504",
-        "UNAVAILABLE", "RESOURCE_EXHAUSTED",
-        "INTERNAL", "DEADLINE_EXCEEDED",
-        "HIGH DEMAND", "TOO MANY REQUESTS"
-    )
-    return any(marker in message for marker in retryable_markers)
-
-
-def generate_content_with_retry(client, **kwargs):
-    max_attempts = 5
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return client.models.generate_content(**kwargs)
-        except Exception as error:
-            if not is_retryable_gemini_error(error):
-                raise
-
-            if attempt == max_attempts:
-                raise GeminiTemporarilyUnavailable(
-                    "Gemini sigue temporalmente saturado después de "
-                    f"{max_attempts} intentos. Inténtalo de nuevo más tarde. "
-                    f"Último error: {str(error)[:500]}"
-                ) from error
-
-            wait_seconds = min(30, 3 * (2 ** (attempt - 1)))
-            wait_seconds += random.uniform(0, 1.5)
-            print(
-                f"Gemini temporalmente no disponible. "
-                f"Reintento {attempt + 1}/{max_attempts} "
-                f"en {wait_seconds:.1f} segundos."
-            )
-            time.sleep(wait_seconds)
-
-
-def get_supabase_client():
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-    if not supabase_url or not supabase_key:
-        raise RuntimeError(
-            "Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en Render"
-        )
-
-    return create_client(supabase_url, supabase_key)
-
-
-def upload_clip_to_supabase(supabase, local_path, job_id, filename):
-    storage_path = f"{job_id}/{filename}"
-
-    with open(local_path, "rb") as clip_file:
-        supabase.storage.from_(SUPABASE_BUCKET).upload(
-            path=storage_path,
-            file=clip_file,
-            file_options={
-                "content-type": "video/mp4",
-                "cache-control": "3600"
-            }
-        )
-
-    return supabase.storage.from_(SUPABASE_BUCKET).get_public_url(storage_path)
 
 app.mount(
     "/clips",
@@ -122,13 +47,15 @@ app.mount(
 @app.get("/")
 def home():
     return {
-        "message": "ClipMaker AI Engine funcionando",
-        "version": "3.0",
-        "ai": "Gemini",
+        "message": "ClipMaker Engine funcionando",
+        "version": "4.0",
+        "ai": False,
         "features": [
             "single_clip",
             "multiple_clips",
-            "ai_highlights"
+            "vertical_1080x1920",
+            "no_overlapping_segments",
+            "5_10_15_30_50_clips"
         ]
     }
 
@@ -140,15 +67,9 @@ def health():
 
 @app.get("/ai-health")
 def ai_health():
-    if not os.getenv("GEMINI_API_KEY"):
-        raise HTTPException(
-            status_code=503,
-            detail="La API Key de Gemini no está configurada"
-        )
-
     return {
-        "status": "configured",
-        "provider": "Google Gemini"
+        "status": "disabled",
+        "message": "La generación actual funciona sin inteligencia artificial."
     }
 
 
@@ -156,7 +77,7 @@ def ai_health():
 # FUNCIONES DE VIDEO
 # ----------------------------------
 
-def get_video_duration(video_path):
+def get_video_duration(video_path: Path) -> float:
     result = subprocess.run(
         [
             "ffprobe",
@@ -172,31 +93,58 @@ def get_video_duration(video_path):
     if result.returncode != 0:
         raise HTTPException(
             status_code=400,
-            detail="No se pudo leer la duración del video"
+            detail="No se pudo leer la duración del video. Comprueba que sea un archivo de video válido."
         )
 
     try:
-        return float(result.stdout.strip())
-    except ValueError:
+        duration = float(result.stdout.strip())
+    except (ValueError, TypeError):
         raise HTTPException(
             status_code=400,
-            detail="Duración de video no válida"
+            detail="La duración del video no es válida."
         )
 
+    if duration <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="El video no tiene una duración válida."
+        )
 
-def make_clip(input_path, output_path, start, duration):
+    return duration
+
+
+def make_clip(input_path: Path, output_path: Path, start: float, duration: float):
+    """
+    Genera un clip vertical 1080x1920.
+    Se usa ultrafast para priorizar velocidad de procesamiento.
+    """
+
+    video_filter = (
+        "scale=1080:1920:"
+        "force_original_aspect_ratio=increase,"
+        "crop=1080:1920,"
+        "setsar=1"
+    )
+
     command = [
-        "ffmpeg", "-y",
-        "-ss", str(start),
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-ss", f"{start:.3f}",
         "-i", str(input_path),
-        "-t", str(duration),
-        "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "-t", f"{duration:.3f}",
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "23",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
+        "-b:a", "128k",
         "-movflags", "+faststart",
+        "-avoid_negative_ts", "make_zero",
         str(output_path)
     ]
 
@@ -207,273 +155,123 @@ def make_clip(input_path, output_path, start, duration):
     )
 
     if result.returncode != 0:
+        error_message = (result.stderr or "Error desconocido de FFmpeg")[-1500:]
         raise RuntimeError(
-            "FFmpeg no pudo generar el clip: " + result.stderr[-1000:]
+            "FFmpeg no pudo generar el clip: " + error_message
         )
 
-
-def save_uploaded_video(video, destination):
-    with open(destination, "wb") as f:
-        shutil.copyfileobj(video.file, f)
-
-    size = os.path.getsize(destination)
-
-    if size == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="El archivo de video está vacío"
-        )
-
-    if size > 300 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail="Para esta primera versión utiliza videos de máximo 300 MB"
-        )
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("FFmpeg terminó sin generar un archivo válido.")
 
 
-# ----------------------------------
-# GEMINI: DETECCIÓN INTELIGENTE
-# ----------------------------------
-
-def analyze_video_with_gemini(
-    video_path,
-    video_duration,
-    quantity,
-    clip_duration,
-    mode,
-    category
-):
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    if not api_key:
-        raise RuntimeError(
-            "No está configurada la variable GEMINI_API_KEY en Render"
-        )
-
-    client = genai.Client(api_key=api_key)
-    uploaded_file = None
+def save_uploaded_video(video: UploadFile, destination: Path):
+    total_size = 0
 
     try:
-        # Subir video a Gemini
-        uploaded_file = client.files.upload(
-            file=str(video_path)
+        with open(destination, "wb") as output_file:
+            while True:
+                chunk = video.file.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                total_size += len(chunk)
+
+                if total_size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="El video supera el límite de 300 MB para esta versión."
+                    )
+
+                output_file.write(chunk)
+
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+
+    if total_size == 0:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail="El archivo de video está vacío."
         )
 
-        # Esperar a que Gemini procese el archivo
-        start_wait = time.monotonic()
 
-        while True:
-            state = getattr(uploaded_file, "state", None)
-            state_name = getattr(state, "name", str(state)).upper()
-
-            if state_name == "ACTIVE":
-                break
-
-            if state_name == "FAILED":
-                raise RuntimeError(
-                    "Gemini no pudo procesar el archivo de video"
-                )
-
-            if time.monotonic() - start_wait > 600:
-                raise RuntimeError(
-                    "Gemini tardó demasiado procesando el video"
-                )
-
-            time.sleep(5)
-
-            uploaded_file = client.files.get(
-                name=uploaded_file.name
-            )
-
-        if mode == "automatic":
-            category_instruction = (
-                "Selecciona los momentos más interesantes de cualquier tipo."
-            )
-        else:
-            category_instruction = (
-                "El usuario quiere clips de esta categoría: "
-                + category
-                + ". Prioriza momentos relacionados con esa categoría."
-            )
-
-        prompt = f"""
-Eres el sistema de detección de momentos destacados de ClipMaker AI.
-
-Analiza el video completo, incluyendo imagen, audio, conversaciones,
-reacciones, cambios de escena y acontecimientos importantes.
-
-DURACIÓN TOTAL DEL VIDEO: {video_duration:.2f} segundos.
-
-CANTIDAD SOLICITADA: {quantity} clips.
-
-DURACIÓN EXACTA DE CADA CLIP: {clip_duration} segundos.
-
-MODO: {mode}.
-
-INSTRUCCIONES DE SELECCIÓN:
-{category_instruction}
-
-Busca momentos que tengan potencial para convertirse en videos cortos:
-- Frases llamativas.
-- Reacciones espontáneas.
-- Momentos graciosos.
-- Información sorprendente.
-- Conversaciones interesantes.
-- Momentos de tensión o emoción.
-- Acciones importantes.
-
-No inventes conversaciones ni acontecimientos.
-
-Debes encontrar exactamente {quantity} momentos diferentes.
-
-Los clips no pueden superponerse entre sí.
-
-Cada momento debe tener suficiente contenido interesante durante
-los {clip_duration} segundos completos.
-
-El inicio debe estar entre 0 y {video_duration - clip_duration:.2f} segundos.
-
-Devuelve exclusivamente JSON válido con esta estructura:
-
-{{
-  "clips": [
-    {{
-      "start_seconds": 12.5,
-      "title": "Título corto del momento",
-      "reason": "Explicación breve de por qué es interesante",
-      "score": 95
-    }}
-  ]
-}}
-
-REGLAS:
-- Devuelve exactamente {quantity} elementos.
-- start_seconds debe ser un número.
-- score debe ser un número entero entre 1 y 100.
-- Ordena los momentos por puntuación de mayor a menor.
-- No agregues explicaciones fuera del JSON.
-"""
-
-        response = generate_content_with_retry(
-            client,
-            model="gemini-3.8-flash",
-            contents=[
-                uploaded_file,
-                prompt
-            ],
-            config={
-                "response_mime_type": "application/json"
-            }
+def validate_multiple_options(quantity: int, duration: int):
+    if quantity not in ALLOWED_QUANTITIES:
+        raise HTTPException(
+            status_code=400,
+            detail="La cantidad debe ser 5, 10, 15, 30 o 50 clips."
         )
 
-        if not response.text:
-            raise RuntimeError(
-                "Gemini no devolvió resultados"
-            )
-
-        raw_text = response.text.strip()
-
-        # Limpiar posibles bloques Markdown
-        raw_text = re.sub(
-            r"^```(?:json)?\s*",
-            "",
-            raw_text
+    if duration not in ALLOWED_DURATIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="La duración debe ser 15, 30, 45 o 60 segundos."
         )
 
-        raw_text = re.sub(
-            r"\s*```$",
-            "",
-            raw_text
+
+def calculate_clip_segments(
+    video_duration: float,
+    quantity: int,
+    clip_duration: int
+):
+    """
+    Distribuye los segmentos a lo largo del video.
+    Cada segmento tiene la duración elegida y no se superpone
+    con el anterior. Si sobra tiempo, se reparte como separación
+    entre los clips para cubrir el video completo.
+    """
+
+    required_seconds = quantity * clip_duration
+
+    if video_duration + 0.05 < required_seconds:
+        minimum_minutes = required_seconds / 60
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"El video es demasiado corto. Para crear {quantity} clips "
+                f"de {clip_duration} segundos necesitas al menos "
+                f"{required_seconds} segundos "
+                f"({minimum_minutes:.1f} minutos) de video."
+            )
         )
 
-        result = json.loads(raw_text)
+    available_gap_time = max(0.0, video_duration - required_seconds)
 
-        clips = result.get("clips", [])
+    if quantity > 1:
+        gap_between_clips = available_gap_time / (quantity - 1)
+    else:
+        gap_between_clips = 0.0
 
-        if not isinstance(clips, list):
-            raise RuntimeError(
-                "La respuesta de Gemini no tiene una lista de clips válida"
-            )
+    segments = []
 
-        if len(clips) < quantity:
-            raise RuntimeError(
-                "Gemini encontró menos momentos de los solicitados. "
-                "Prueba con otro video o una cantidad menor."
-            )
+    for index in range(quantity):
+        start = index * (clip_duration + gap_between_clips)
 
-        # Validar y ordenar los momentos
-        valid_clips = []
+        # Evitar que errores de redondeo hagan que el último clip
+        # se salga del final del video.
+        latest_start = max(0.0, video_duration - clip_duration)
+        start = min(start, latest_start)
 
-        for clip in clips:
-            start = float(clip["start_seconds"])
+        segments.append({
+            "number": index + 1,
+            "start": round(start, 3),
+            "end": round(start + clip_duration, 3),
+            "duration": clip_duration
+        })
 
-            if start < 0:
-                continue
+    return segments
 
-            if start + clip_duration > video_duration:
-                continue
 
-            valid_clips.append({
-                "start_seconds": start,
-                "title": str(clip.get("title", "Momento destacado"))[:100],
-                "reason": str(clip.get("reason", ""))[:300],
-                "score": max(
-                    1,
-                    min(100, int(clip.get("score", 50)))
-                )
-            })
-
-        # Primero los momentos con mayor puntuación
-        valid_clips.sort(
-            key=lambda item: item["score"],
-            reverse=True
-        )
-
-        # Evitar clips superpuestos
-        selected = []
-
-        for candidate in valid_clips:
-            candidate_start = candidate["start_seconds"]
-            candidate_end = candidate_start + clip_duration
-
-            overlaps = any(
-                candidate_start < item["start_seconds"] + clip_duration
-                and candidate_end > item["start_seconds"]
-                for item in selected
-            )
-
-            if not overlaps:
-                selected.append(candidate)
-
-            if len(selected) == quantity:
-                break
-
-        if len(selected) < quantity:
-            raise RuntimeError(
-                "La IA no encontró suficientes momentos diferentes "
-                "sin superposición. Prueba con menos clips."
-            )
-
-        # Orden cronológico para facilitar la revisión
-        selected.sort(
-            key=lambda item: item["start_seconds"]
-        )
-
-        return selected
-
-    finally:
-        # Intentar borrar el archivo remoto de Gemini
-        if uploaded_file is not None:
-            try:
-                client.files.delete(
-                    name=uploaded_file.name
-                )
-            except Exception:
-                pass
+def create_job_directory():
+    job_id = uuid.uuid4().hex
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_id, job_dir
 
 
 # ----------------------------------
-# PROCESAMIENTO ORIGINAL
+# PROCESAMIENTO DE UN SOLO CLIP
 # ----------------------------------
 
 @app.post("/process")
@@ -485,33 +283,38 @@ async def process_video(
     if start < 0 or duration <= 0 or duration > 60:
         raise HTTPException(
             status_code=400,
-            detail="Tiempo de recorte no válido"
+            detail="El inicio debe ser positivo y la duración debe estar entre 1 y 60 segundos."
         )
 
-    temp_dir = tempfile.mkdtemp()
-    input_path = os.path.join(temp_dir, "input.mp4")
-    output_path = os.path.join(temp_dir, "clipmaker.mp4")
+    job_dir = Path(tempfile.mkdtemp(prefix="clipmaker_single_"))
+    input_path = job_dir / "original_video"
+    output_path = job_dir / "clipmaker_vertical.mp4"
 
     try:
         save_uploaded_video(video, input_path)
+        video_duration = get_video_duration(input_path)
 
-        make_clip(
-            input_path,
-            output_path,
-            start,
-            duration
-        )
+        if start + duration > video_duration:
+            raise HTTPException(
+                status_code=400,
+                detail="El recorte solicitado supera la duración del video original."
+            )
+
+        make_clip(input_path, output_path, start, duration)
 
         return FileResponse(
             output_path,
             media_type="video/mp4",
-            filename="clipmaker_vertical.mp4"
+            filename="clipmaker_vertical.mp4",
+            background=None
         )
 
     except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise
 
     except Exception as error:
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(
             status_code=500,
             detail=f"No se pudo procesar el video: {str(error)}"
@@ -522,7 +325,7 @@ async def process_video(
 
 
 # ----------------------------------
-# GENERACIÓN MÚLTIPLE ORIGINAL
+# GENERACIÓN MÚLTIPLE SIN IA
 # ----------------------------------
 
 @app.post("/process-multiple")
@@ -531,22 +334,9 @@ async def process_multiple(
     quantity: int = 5,
     duration: int = 30
 ):
-    if quantity not in [5, 10, 15]:
-        raise HTTPException(
-            status_code=400,
-            detail="La cantidad debe ser 5, 10 o 15 clips"
-        )
+    validate_multiple_options(quantity, duration)
 
-    if duration not in [15, 30, 45, 60]:
-        raise HTTPException(
-            status_code=400,
-            detail="La duración debe ser 15, 30, 45 o 60 segundos"
-        )
-
-    job_id = uuid.uuid4().hex
-    job_dir = JOBS_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-
+    job_id, job_dir = create_job_directory()
     input_path = job_dir / "original_video.mp4"
 
     try:
@@ -554,38 +344,43 @@ async def process_multiple(
 
         video_duration = get_video_duration(input_path)
 
-        if video_duration < duration:
-            raise HTTPException(
-                status_code=400,
-                detail="El video original es más corto que la duración elegida"
-            )
+        segments = calculate_clip_segments(
+            video_duration,
+            quantity,
+            duration
+        )
 
-        max_start = video_duration - duration
         clips = []
 
-        for index in range(quantity):
-            start = max_start * index / (quantity - 1)
-
-            filename = f"clip_{index + 1:02d}.mp4"
+        for segment in segments:
+            index = segment["number"]
+            filename = f"clip_{index:02d}.mp4"
             output_path = job_dir / filename
 
             make_clip(
                 input_path,
                 output_path,
-                start,
+                segment["start"],
                 duration
             )
 
             clips.append({
-                "number": index + 1,
+                "number": index,
                 "filename": filename,
                 "duration": duration,
+                "start_seconds": segment["start"],
+                "end_seconds": segment["end"],
                 "url": f"/clips/{job_id}/{filename}"
             })
 
         return {
             "status": "completed",
+            "engine": "ClipMaker Engine",
+            "ai_provider": None,
+            "ai_used": False,
+            "selection_mode": "distributed_non_overlapping_segments",
             "job_id": job_id,
+            "source_duration": round(video_duration, 2),
             "total_clips": len(clips),
             "duration": duration,
             "clips": clips
@@ -597,7 +392,6 @@ async def process_multiple(
 
     except Exception as error:
         shutil.rmtree(job_dir, ignore_errors=True)
-
         raise HTTPException(
             status_code=500,
             detail=f"Error generando los clips: {str(error)}"
@@ -608,45 +402,25 @@ async def process_multiple(
 
 
 # ----------------------------------
-# NUEVO: GENERACIÓN CON INTELIGENCIA ARTIFICIAL
+# COMPATIBILIDAD TEMPORAL CON EL FRONTEND
 # ----------------------------------
 
 @app.post("/process-ai")
-def process_ai(
+async def process_ai(
     video: UploadFile = File(...),
     quantity: int = 5,
     duration: int = 30,
     mode: str = "automatic",
     category: str = ""
 ):
-    if quantity not in [5, 10, 15]:
-        raise HTTPException(
-            status_code=400,
-            detail="La cantidad debe ser 5, 10 o 15 clips"
-        )
+    """
+    Compatibilidad temporal: si una versión antigua del frontend
+    todavía llama a /process-ai, genera clips distribuidos sin IA.
+    """
 
-    if duration not in [15, 30, 45, 60]:
-        raise HTTPException(
-            status_code=400,
-            detail="La duración debe ser 15, 30, 45 o 60 segundos"
-        )
+    validate_multiple_options(quantity, duration)
 
-    if mode not in ["automatic", "custom"]:
-        raise HTTPException(
-            status_code=400,
-            detail="El modo debe ser automatic o custom"
-        )
-
-    if mode == "custom" and not category.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Debes indicar una categoría para el modo personalizado"
-        )
-
-    job_id = uuid.uuid4().hex
-    job_dir = JOBS_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-
+    job_id, job_dir = create_job_directory()
     input_path = job_dir / "original_video.mp4"
 
     try:
@@ -654,91 +428,63 @@ def process_ai(
 
         video_duration = get_video_duration(input_path)
 
-        if video_duration < quantity * duration:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Para crear {quantity} clips diferentes de "
-                    f"{duration} segundos, utiliza un video de al menos "
-                    f"{quantity * duration} segundos."
-                )
-            )
-
-        # Analizar el video con Gemini
-        selected_clips = analyze_video_with_gemini(
-            input_path,
+        segments = calculate_clip_segments(
             video_duration,
             quantity,
-            duration,
-            mode,
-            category
+            duration
         )
 
-        generated_clips = []
-        supabase = get_supabase_client()
+        clips = []
 
-        # Crear cada MP4 con FFmpeg y guardarlo de forma permanente en Supabase
-        for index, moment in enumerate(selected_clips):
-            filename = f"clip_{index + 1:02d}.mp4"
+        for segment in segments:
+            index = segment["number"]
+            filename = f"clip_{index:02d}.mp4"
             output_path = job_dir / filename
-
-            start = moment["start_seconds"]
 
             make_clip(
                 input_path,
                 output_path,
-                start,
+                segment["start"],
                 duration
             )
 
-            public_url = upload_clip_to_supabase(
-                supabase,
-                output_path,
-                job_id,
-                filename
-            )
-
-            generated_clips.append({
-                "number": index + 1,
+            clips.append({
+                "number": index,
                 "filename": filename,
                 "duration": duration,
-                "start_seconds": start,
-                "title": moment["title"],
-                "reason": moment["reason"],
-                "score": moment["score"],
-                "url": public_url
+                "start_seconds": segment["start"],
+                "end_seconds": segment["end"],
+                "title": f"Clip {index}",
+                "reason": "Fragmento seleccionado automáticamente por distribución temporal, sin IA.",
+                "score": None,
+                "url": f"/clips/{job_id}/{filename}"
             })
 
         return {
             "status": "completed",
-            "engine": "ClipMaker AI",
-            "ai_provider": "Google Gemini",
+            "engine": "ClipMaker Engine",
+            "ai_provider": None,
+            "ai_used": False,
+            "message": "La generación se realizó sin inteligencia artificial.",
             "mode": mode,
             "category": category if mode == "custom" else None,
             "job_id": job_id,
-            "total_clips": len(generated_clips),
+            "source_duration": round(video_duration, 2),
+            "total_clips": len(clips),
             "duration": duration,
-            "clips": generated_clips
+            "clips": clips
         }
 
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
 
-    except GeminiTemporarilyUnavailable as error:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(
-            status_code=503,
-            detail=str(error)
-        )
-
     except Exception as error:
         shutil.rmtree(job_dir, ignore_errors=True)
-
         raise HTTPException(
             status_code=500,
-            detail=f"Error en el procesamiento inteligente: {str(error)}"
+            detail=f"Error generando los clips: {str(error)}"
         )
 
     finally:
-        video.file.close()
+        await video.close()
