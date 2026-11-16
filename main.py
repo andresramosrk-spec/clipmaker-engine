@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import random
 import uuid
 import shutil
 import subprocess
@@ -36,6 +37,48 @@ JOBS_DIR = Path("/tmp/clipmaker_jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 SUPABASE_BUCKET = "clipmaker-clips"
+
+
+class GeminiTemporarilyUnavailable(Exception):
+    """Gemini está temporalmente saturado o limitando solicitudes."""
+
+
+def is_retryable_gemini_error(error):
+    message = str(error).upper()
+    retryable_markers = (
+        "429", "500", "502", "503", "504",
+        "UNAVAILABLE", "RESOURCE_EXHAUSTED",
+        "INTERNAL", "DEADLINE_EXCEEDED",
+        "HIGH DEMAND", "TOO MANY REQUESTS"
+    )
+    return any(marker in message for marker in retryable_markers)
+
+
+def generate_content_with_retry(client, **kwargs):
+    max_attempts = 5
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(**kwargs)
+        except Exception as error:
+            if not is_retryable_gemini_error(error):
+                raise
+
+            if attempt == max_attempts:
+                raise GeminiTemporarilyUnavailable(
+                    "Gemini sigue temporalmente saturado después de "
+                    f"{max_attempts} intentos. Inténtalo de nuevo más tarde. "
+                    f"Último error: {str(error)[:500]}"
+                ) from error
+
+            wait_seconds = min(30, 3 * (2 ** (attempt - 1)))
+            wait_seconds += random.uniform(0, 1.5)
+            print(
+                f"Gemini temporalmente no disponible. "
+                f"Reintento {attempt + 1}/{max_attempts} "
+                f"en {wait_seconds:.1f} segundos."
+            )
+            time.sleep(wait_seconds)
 
 
 def get_supabase_client():
@@ -311,7 +354,8 @@ REGLAS:
 - No agregues explicaciones fuera del JSON.
 """
 
-        response = client.models.generate_content(
+        response = generate_content_with_retry(
+            client,
             model="gemini-3.8-flash",
             contents=[
                 uploaded_file,
@@ -680,6 +724,13 @@ def process_ai(
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
+
+    except GeminiTemporarilyUnavailable as error:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=503,
+            detail=str(error)
+        )
 
     except Exception as error:
         shutil.rmtree(job_dir, ignore_errors=True)
